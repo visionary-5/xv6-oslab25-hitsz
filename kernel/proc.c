@@ -291,6 +291,15 @@ void reparent(struct proc *p) {
   }
 }
 
+// Define the states array at the beginning of proc.c or in a header file.
+static char *states[] = {
+    [UNUSED]   "unused",
+    [SLEEPING] "sleep ",
+    [RUNNABLE] "runble",
+    [RUNNING]  "run   ",
+    [ZOMBIE]   "zombie"
+};
+
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait().
@@ -298,6 +307,23 @@ void exit(int status) {
   struct proc *p = myproc();
 
   if (p == initproc) panic("init exiting");
+
+  // 输出当前进程的父进程信息
+  struct proc * parent = p->parent;
+  if (parent != 0){
+    exit_info("proc %d exit, parent pid %d, name %s, state %s\n",
+              p->pid, parent->pid, parent->name, states[parent->state]);
+  }
+
+  // 输出当前进程的子进程的信息
+  int child_num = 0;
+  struct proc *pp;
+  for (pp = proc; pp < &proc[NPROC]; pp++){
+    if(pp->parent == p){
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n",
+                p->pid,child_num++,pp->pid,pp->name,states[pp->state]);
+    }
+  }
 
   // Close all open files.
   for (int fd = 0; fd < NOFILE; fd++) {
@@ -356,7 +382,7 @@ void exit(int status) {
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
-int wait(uint64 addr) {
+int wait(uint64 addr,int flags) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
@@ -396,6 +422,11 @@ int wait(uint64 addr) {
 
     // No point waiting if we don't have any children.
     if (!havekids || p->killed) {
+      release(&p->lock);
+      return -1;
+    }
+
+    if (flags == 1){
       release(&p->lock);
       return -1;
     }

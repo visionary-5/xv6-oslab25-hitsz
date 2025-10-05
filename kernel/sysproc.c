@@ -20,8 +20,10 @@ uint64 sys_fork(void) { return fork(); }
 
 uint64 sys_wait(void) {
   uint64 p;
+  int flags;
   if (argaddr(0, &p) < 0) return -1;
-  return wait(p);
+  if (argint(1, &flags) < 0) return -1;
+  return wait(p,flags);        //获取第二个参数flags 并传给wait
 }
 
 uint64 sys_sbrk(void) {
@@ -79,5 +81,46 @@ uint64 sys_rename(void) {
   struct proc *p = myproc();
   memmove(p->name, name, len);
   p->name[len] = '\0';
+  return 0;
+}
+
+uint64 sys_yield(void)
+{
+  struct proc *p = myproc();
+
+  // 打印当前进程的内核线程上下文保存区域地址范围
+  printf("Save the context of the process to the memory region from address %p to %p\n",
+         &p->context, &p->context + 1);
+
+  // 打印当前进程的 pid 和用户态 pc（陷入内核的 ecall 指令地址）
+  printf("Current running process pid is %d and user pc is %p\n",
+         p->pid, (void*)p->trapframe->epc);
+
+  // 从当前进程起，环形遍历全局进程表，查找下一个 RUNNABLE 进程并打印
+  int pi = -1;
+  for (int i = 0; i < NPROC; i++) {
+    if (&proc[i] == p) { pi = i; break; }
+  }
+
+  if (pi != -1) {
+    for (int step = 1; step <= NPROC; step++) {
+      int idx = (pi + step) % NPROC;
+      struct proc *q = &proc[idx];
+      if (q == p) continue;
+
+      acquire(&q->lock);
+      if (q->state == RUNNABLE) {
+        // RUNNABLE 进程的 trapframe->epc 即为它恢复到用户态时的 PC
+        printf("Next runnable process pid is %d and user pc is %p\n",
+               q->pid, (void*)q->trapframe->epc);
+        release(&q->lock);
+        break;
+      }
+      release(&q->lock);
+    }
+  }
+
+  // 让出 CPU（xv6 已实现）
+  yield();
   return 0;
 }
