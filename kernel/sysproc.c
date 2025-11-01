@@ -99,9 +99,9 @@ uint64 sys_yield(void)
   // 从当前进程起，环形遍历全局进程表，查找下一个 RUNNABLE 进程并打印
   int pi = -1;
   for (int i = 0; i < NPROC; i++) {
-    if (&proc[i] == p) { pi = i; break; }
+    if (&proc[i] == p) { pi = i; break; } // 当前进程 p 在进程表 proc[] 数组中的下标
   }
-
+  
   if (pi != -1) {
     for (int step = 1; step <= NPROC; step++) {
       int idx = (pi + step) % NPROC;

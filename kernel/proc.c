@@ -291,7 +291,7 @@ void reparent(struct proc *p) {
   }
 }
 
-// Define the states array at the beginning of proc.c or in a header file.
+// Define the states array 
 static char *states[] = {
     [UNUSED]   "unused",
     [SLEEPING] "sleep ",
@@ -308,14 +308,14 @@ void exit(int status) {
 
   if (p == initproc) panic("init exiting");
 
-  // 输出当前进程的父进程信息
+  // output parent information
   struct proc * parent = p->parent;
   if (parent != 0){
     exit_info("proc %d exit, parent pid %d, name %s, state %s\n",
               p->pid, parent->pid, parent->name, states[parent->state]);
   }
 
-  // 输出当前进程的子进程的信息
+  // output children information
   int child_num = 0;
   struct proc *pp;
   for (pp = proc; pp < &proc[NPROC]; pp++){
