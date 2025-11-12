@@ -316,21 +316,13 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
-  uint64 n, va0, pa0;
-
-  while (len > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > len) n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  // 使用 copyin_new 替代原来的软件模拟地址翻译
+  // 设置 SSTATUS_SUM 位以允许在 S 模式访问用户页面
+  w_sstatus(r_sstatus() | SSTATUS_SUM);
+  int ret = copyin_new(pagetable, dst, srcva, len);
+  // 清除 SSTATUS_SUM 位
+  w_sstatus(r_sstatus() & ~SSTATUS_SUM);
+  return ret;
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -338,38 +330,13 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while (got_null == 0 && max > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > max) n = max;
-
-    char *p = (char *)(pa0 + (srcva - va0));
-    while (n > 0) {
-      if (*p == '\0') {
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if (got_null) {
-    return 0;
-  } else {
-    return -1;
-  }
+  // 使用 copyinstr_new 替代原来的软件模拟地址翻译
+  // 设置 SSTATUS_SUM 位以允许在 S 模式访问用户页面
+  w_sstatus(r_sstatus() | SSTATUS_SUM);
+  int ret = copyinstr_new(pagetable, dst, srcva, max);
+  // 清除 SSTATUS_SUM 位
+  w_sstatus(r_sstatus() & ~SSTATUS_SUM);
+  return ret;
 }
 
 // check if use global kpgtbl or not
@@ -378,4 +345,200 @@ int test_pagetable() {
   uint64 gsatp = MAKE_SATP(kernel_pagetable);
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
+}
+
+
+// Print "||" indentation: depth times, separated by three spaces.
+static void
+pt_print_indent(int depth)
+{
+  for (int i = 0; i < depth; i++) {
+    printf("||");
+    if (i != depth - 1)
+      printf("   ");
+  }
+}
+
+// Build "rwxu" style flags string for printing with %s.
+static void
+pt_flags_str(pte_t pte, char out[5])
+{
+  out[0] = (pte & PTE_R) ? 'r' : '-';
+  out[1] = (pte & PTE_W) ? 'w' : '-';
+  out[2] = (pte & PTE_X) ? 'x' : '-';
+  out[3] = (pte & PTE_U) ? 'u' : '-';
+  out[4] = 0;
+}
+
+// level: 2=top (VPN[2]), 1=middle (VPN[1]), 0=leaf level (VPN[0])
+// va_base accumulates chosen VPN bits so far.
+static void
+vmprint_rec(pagetable_t pt, int level, uint64 va_base, int depth)
+{
+  for (int idx = 0; idx < 512; idx++) {
+    pte_t pte = pt[idx];
+    if ((pte & PTE_V) == 0)
+      continue; // only print valid entries
+
+    uint64 pa = PTE2PA(pte);
+    char flags[5];
+    pt_flags_str(pte, flags);
+
+    // Compute the VA base for this entry index at this level.
+    int shift = level * 9 + 12; // 30, 21, 12 for levels 2,1,0
+    uint64 va_here = va_base | ((uint64)idx << shift);
+
+    // Non-leaf if V set and no R/W/X set.
+    int is_leaf = (pte & (PTE_R | PTE_W | PTE_X)) != 0;
+
+    pt_print_indent(depth);
+    if (is_leaf) {
+      // Leaf: print VA -> PA with flags
+      printf("idx: %d: va: %p -> pa: %p, flags: %s\n",
+             idx, (void*)va_here, (void*)pa, flags);
+    } else {
+      // Non-leaf: print PA (child page table) with flags (likely "----")
+      printf("idx: %d: pa: %p, flags: %s\n",
+             idx, (void*)pa, flags);
+
+      if (level > 0) {
+        // Recurse into child page table
+        vmprint_rec((pagetable_t)pa, level - 1, va_here, depth + 1);
+      }
+    }
+  }
+}
+
+void
+vmprint(pagetable_t pgtbl)
+{
+  // First line prints the page table pointer itself.
+  printf("page table %p\n", pgtbl);
+  vmprint_rec(pgtbl, 2, 0, 1);
+}
+
+// 创建独立内核页表：保持内核直接映射（不映射 CLINT）
+pagetable_t
+kvmcreate(void)
+{
+  pagetable_t kpgtbl = (pagetable_t)kalloc();
+  if (kpgtbl == 0)
+    return 0;
+  memset(kpgtbl, 0, PGSIZE);
+
+  // 设备映射（直接映射）
+  if (mappages(kpgtbl, UART0,   PGSIZE,   UART0,   PTE_R|PTE_W) < 0) goto bad;
+  if (mappages(kpgtbl, VIRTIO0, PGSIZE,   VIRTIO0, PTE_R|PTE_W) < 0) goto bad;
+  if (mappages(kpgtbl, PLIC,    0x400000, PLIC,    PTE_R|PTE_W) < 0) goto bad;
+
+  // 内核文本（只读+可执行）
+  if (mappages(kpgtbl, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R|PTE_X) < 0) goto bad;
+
+  // 内核数据 + 剩余物理内存（读写）
+  if (mappages(kpgtbl, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext, PTE_R|PTE_W) < 0) goto bad;
+
+  // trampoline（最高页）
+  if (mappages(kpgtbl, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R|PTE_X) < 0) goto bad;
+
+  // 注意：不要映射 CLINT
+  return kpgtbl;
+
+bad:
+  kvmfree(kpgtbl); // 只释放页表页，不释放叶子物理页帧
+  return 0;
+}
+
+// 递归释放页表页，叶子仅清 PTE，不 free 物理页帧
+static void
+freewalk_all(pagetable_t pagetable)
+{
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) == 0) continue;
+
+    if ((pte & (PTE_R|PTE_W|PTE_X)) == 0) {
+      uint64 child = PTE2PA(pte);
+      freewalk_all((pagetable_t)child);
+      pagetable[i] = 0;
+    } else {
+      pagetable[i] = 0; // 叶子：只把 PTE 清零
+    }
+  }
+  kfree((void*)pagetable);
+}
+
+void
+kvmfree(pagetable_t kpgtbl)
+{
+  if (kpgtbl == 0)
+    return;
+  
+  // 在释放页表前，先清除用户空间的映射（共享的部分）
+  // 避免重复释放用户页表的 Level-0 页表
+  pte_t *kpte_l2 = &kpgtbl[0];
+  if (*kpte_l2 & PTE_V) {
+    pagetable_t kpt_l1 = (pagetable_t)PTE2PA(*kpte_l2);
+    // 清空用户空间映射范围的 Level-1 PTE（前 96 项）
+    // 这些项指向的是用户页表的 Level-0 页表，不应该被释放
+    for (int i = 0; i < 96; i++) {
+      kpt_l1[i] = 0;
+    }
+  }
+  
+  // 现在可以安全地释放页表了
+  freewalk_all(kpgtbl);
+}
+
+// 同步用户页表到内核页表
+// 用户地址空间为 0x0 - 0xC000000 (PLIC地址)
+// 按照推荐方案：内核页表的次级页表项直接指向用户页表的叶子页表
+void
+sync_pagetable(pagetable_t kpgtbl, pagetable_t upgtbl)
+{
+  // PLIC 地址是 0x0C000000 = 192MB
+  // 用户地址空间最大为 PLIC (0 - 192MB)
+  // 
+  // RISC-V Sv39 三级页表：
+  // - Level 2 (顶级): 每项覆盖 1GB (2^30)
+  // - Level 1 (次级): 每项覆盖 2MB (2^21)
+  // - Level 0 (叶子): 每项覆盖 4KB (2^12)
+  //
+  // 0xC000000 = 192MB，需要 192/2 = 96 个 Level-1 页表项
+  // 这 96 个项都在 Level-2 的第 0 项下面
+  
+  // 首先，确保内核页表的 Level-2 第0项存在
+  pte_t *kpte_l2 = &kpgtbl[0];
+  pagetable_t kpt_l1;
+  
+  if (*kpte_l2 & PTE_V) {
+    // 已经存在 Level-1 页表，清空前 96 项（用户空间范围）
+    kpt_l1 = (pagetable_t)PTE2PA(*kpte_l2);
+    // 清空用户空间映射范围的 Level-1 PTE
+    for (int i = 0; i < 96; i++) {
+      kpt_l1[i] = 0;
+    }
+  } else {
+    // 创建新的 Level-1 页表
+    kpt_l1 = (pagetable_t)kalloc();
+    if (kpt_l1 == 0)
+      return;
+    memset(kpt_l1, 0, PGSIZE);
+    *kpte_l2 = PA2PTE(kpt_l1) | PTE_V;
+  }
+  
+  // 获取用户页表的 Level-2 第0项
+  pte_t *upte_l2 = &upgtbl[0];
+  if (!(*upte_l2 & PTE_V))
+    return;  // 用户页表为空
+  
+  pagetable_t upt_l1 = (pagetable_t)PTE2PA(*upte_l2);
+  
+  // 复制用户页表 Level-1 的前 96 项到内核页表
+  // 96 项 * 2MB = 192MB，正好覆盖 0 - PLIC
+  // 注意：这里直接让内核 Level-1 的项指向用户 Level-0 页表（共享）
+  for (int i = 0; i < 96; i++) {
+    if (upt_l1[i] & PTE_V) {
+      kpt_l1[i] = upt_l1[i];
+    }
+  }
 }
